@@ -1,0 +1,344 @@
+#!/usr/bin/python -tt
+# 
+# Wolfgang Miedl <wmiedl@zid.tuwien.ac.at>
+#
+# 
+#
+# vim: syn=python ts=4 sts=4 enc=utf-8 tw=78 expandtab
+#
+
+"""
+makemanifestfromdir is simple puppet manifest generator to automate creation
+of file staging manifests from existing directory structures.
+
+Upon invocation, it will traverse the directory tree, starting at the current
+working directory, and generate file{}-statements mapping the structure to a
+manifest.
+
+= When are file-statements generated?
+
+File-Statements are only generated if the current entry has a different
+owner/group/permission structure than its parent directory; it will never set
+the mode 755 on a directory but instead set 644 and rely on puppets notion of
+automatically setting the executeable bit on directories whenever the readable
+bit is set.
+
+= How does it handle symlinks?
+
+The script currently does not dereference symlinks but instead converts them
+to file { ensure => link} statements.
+
+= Default ownership statements
+
+By default it is assumed that the root directory should be owned by root/root
+with mode 644; you can use the options --user/--group/--mode to change the
+default behavior.
+
+Example usage:
+* makemanifestfromdir --output example.pp --prefix 'modules/bind' -o -
+
+"""
+
+import os
+import sys
+import stat
+import re
+
+from optparse import OptionParser
+from pwd import getpwuid
+from grp import getgrgid
+
+class ManifestGenerator:
+
+    def verbose(self, msg):
+        if (self.options.verbose):
+            print msg
+
+    def walk(self, path, recursionDepth, pUser = None, pGroup = None, pMode = None):
+
+        # FIXME
+        # Since this script is currently too dumb to detect symlink loops
+        # it uses a hardcoded recursion depth limiter
+        #
+        # FIXME 2: Since we currently do not implement symlink dereference
+        # the recursion limiter is not needed.
+        #if (recursionDepth > self.recurselimiter):
+        #    return
+
+        recursionDepth = recursionDepth + 1
+       
+        # Check if we match the ignore list pattern
+        if self.ignoreRe != None:
+            if self.ignoreRe.search(path) != None:
+                return
+
+        pstat = os.lstat(path) 
+        mode = pstat.st_mode
+
+        # Get current user/group/mode data
+        currentUser = getpwuid(pstat.st_uid)[0]
+        currentGroup = getgrgid(pstat.st_gid)[0]
+        currentMode = stat.S_IMODE(mode)
+
+        self.verbose("Walking path " + path)
+        self.verbose("\tOwned by %s:%s with mode %o" % (currentUser,
+            currentGroup, currentMode))
+
+        # First check if path is currently pointing to a directory or not      
+        if stat.S_ISDIR(mode):
+            # Pointing to a directory
+            self.verbose("\tIt is a directory")
+            
+
+            # Puppet interprets the mode '0664' on directories as '0755', so
+            # change appropriately
+            if pMode == 0755:
+               pMode = 0644
+
+            if currentMode == 0755:
+                currentMode = 0644
+
+            # Compare to parent information
+            self.verbose("\tComparing permission data")
+            if pUser != currentUser:
+                self.verbose("\tU: p: %s, c: %s" % (pUser,currentUser))
+
+            if pGroup != currentGroup:
+                self.verbose("\tG: p: %s, c: %s" % (pGroup,currentGroup))
+
+            if pMode != currentMode:
+                self.verbose("\tM: p: %s, c: %s" %
+                    (self.makePrettyMode(pMode),self.makePrettyMode(currentMode)))
+
+            if (not (pUser == currentUser and pGroup ==
+                currentGroup and pMode == currentMode)):
+                
+                # Not matching. If one of the values equals to None, we are at
+                # the root of the directory subtree and should initialize the
+                # values to the default user/password/mode
+
+                # We need to generate a new file statement
+                self.statementBegin(path)
+
+                self.statementParam("ensure", "directory", '')
+                self.statementParam("owner", currentUser)
+                self.statementParam("group", currentGroup)
+                self.statementParam("mode", 
+                    self.makePrettyMode(currentMode))
+                
+                if (pUser == None):
+                    pUser = self.options.user
+                    pGroup = self.options.group
+                    pMode = self.options.mode
+
+                # Add ignore statement if necessary
+                if (self.options.ignorePattern != None):
+                    self.statementParam("ignore", self.options.ignorePattern)
+
+                self.statementEnd(path, directory=True)
+
+            # Recurse into child-dirs
+            childs = os.listdir(path)
+
+            for child in childs:
+                childpath = "%s/%s" % (path, child)
+                self.walk(childpath, recursionDepth, currentUser, currentGroup,
+                    currentMode)
+        elif stat.S_ISLNK(mode):
+            # Handle symbolic links
+            self.verbose("\tIt is a symbolic link")
+
+            target = os.path.realpath(path)
+
+            self.statementBegin(path)
+            self.statementParam("ensure", "link", '')
+            self.statementParam("target", target)
+            self.statementEnd()
+
+        elif stat.S_ISREG(mode):
+            # Handle regular files:
+            self.verbose("\tIt is a regular file")
+
+            # Compare to parent information
+            self.verbose("\tComparing permission data")
+            if pUser != currentUser:
+                self.verbose("\tU: p: %s, c: %s" % (pUser,currentUser))
+
+            if pGroup != currentGroup:
+                self.verbose("\tG: p: %s, c: %s" % (pGroup,currentGroup))
+
+            if pMode != currentMode:
+                self.verbose("\tM: p: %s, c: %s" %
+                    (self.makePrettyMode(pMode),self.makePrettyMode(currentMode)))
+
+            if (not (pUser == currentUser and pGroup ==
+                currentGroup and pMode == currentMode)):
+
+                self.statementBegin(path) 
+                self.statementParam("ensure", "file", '')
+                self.statementParam("owner", currentUser)
+                self.statementParam("group", currentGroup)
+                self.statementParam("mode", 
+                    self.makePrettyMode(currentMode))
+                
+                self.statementEnd(path)
+
+        else:
+            print "WARNING: Don't know how to handle file %s with statmode %d!" % (path, mode)
+
+        return
+                
+    def makePrettyMode(self, mode):
+        
+        if mode == None:
+            return mode
+
+        s = "%o" % mode
+
+        if len(s) == 3:
+            s = "0" + s
+
+        return s
+
+    def rewritePath(self, path):
+        if (self.options.rebasepath != None):
+            path = path.replace(self.cwd, self.options.rebasepath)
+
+        return path
+
+
+    def statementBegin(self, path):
+        path = self.rewritePath(path)
+        self.verbose("\tTriggering statement generation for path %s" % path)
+        self.lines.append("file {'%s':\n" % path)
+
+        return
+
+    def statementEnd(self, path=None, directory=False):
+    
+
+       # Auto-Add source-statement if appropriate
+        if (self.options.prefix != None and path != None):
+            path = self.rewritePath(path)
+            self.statementSourceParam(path)
+    
+            # Add recursion (and recursion limit) if necessary
+            if (self.options.enableRecursion and directory):
+                self.statementParam("recurse", 'true', '')
+
+                if (self.options.recursionLimit != None):
+                    self.statementParam("recurselimit",
+                        self.options.recursionLimit)
+
+
+        self.lines.append("}\n\n")
+
+        return
+
+    def statementParam(self, param, value, quoteLiteral = '\''):
+        self.lines.append("\t%s\t=>\t%s%s%s,\n" % 
+            (param, quoteLiteral, value, quoteLiteral))
+
+        return
+
+    def statementSourceParam(self, path):
+        url = "puppet:///%s%s" % (self.options.prefix, path)
+
+        self.statementParam('source', url)
+
+        return
+
+    def dumpManifest(self):
+        if (self.options.output == sys.stdout):
+            f = self.options.output
+        else:
+            f = open(self.options.output, "w")
+
+        for line in self.lines:
+            f.write(line)
+
+        f.flush()
+        f.close()
+
+    def run(self):        
+        self.walk(path = self.cwd, recursionDepth = 0)
+
+    def __init__(self, options):
+
+        self.options = options
+
+        # Convert mode from string literal to octal
+        self.options.mode = int(self.options.mode,8)
+
+        if (self.options.ignorePattern != None):
+            self.ignoreRe = re.compile(self.options.ignorePattern)
+        else:
+            self.ignoreRe = None
+
+        if (self.options.output == "-"):
+            self.options.output = sys.stdout
+
+        self.lines = []
+        self.recurselimiter = 20
+
+        if (self.options.cwd != None):
+            self.cwd = self.options.cwd
+            self.cwd = os.path.normpath(self.cwd)
+        else:
+            self.cwd = os.getcwd()
+
+def main(args):
+    parser = OptionParser()
+    
+    parser.add_option("-u", "--user", action="store", dest="user",
+        help="The user that should own the toplevel directory")
+    parser.add_option("-g", "--group", action="store", dest="group",
+        help="The group that should own the toplevel directory")
+    parser.add_option("-m", "--mode", action="store", dest="mode",
+        help="The mode that should be viewed as the default \
+        mode when generating the manifest")
+    parser.add_option("-o", "--output", action="store", dest="output",
+        metavar="FILE",
+        help="Write manifest to FILE instead of stdout")
+#    parser.add_option("-d", "--dereference", action="store_true",
+#        dest="followSymlinks", help="Dereference and follow symlinks")
+    parser.add_option("-p", "--prefix", action="store", dest="prefix",
+        help="Setting this option will generate a" +
+            "source => \"puppet:///PREFIX/${name}\"' parameter")
+    parser.add_option("-n", "--no-recurse", action="store_false",
+        dest="enableRecursion", 
+        help="Do not generate 'recurse => true' parameters for directories")
+    parser.add_option("-l", "--limit-recursion", action="store",
+        dest="recursionLimit", metavar="LIMIT",
+        help="Set 'recurselimit => LIMIT' on directories")
+    parser.add_option("-i", "--ignore", action="store", dest="ignorePattern", 
+        metavar="PATTERN",
+        help="Generate 'ignore => PATTERN' statements for directories")
+    parser.add_option("-v", "--verbose", action="store_true", dest="verbose",
+        help="Enable verbose output")
+    parser.add_option("-s", "--source-path", action="store", dest="cwd",
+        metavar="SOURCEPATH",
+        help="Use SOURCEPATH instead of the current working directory as source")
+    parser.add_option("-r", "--rebase-path", action="store",
+        dest="rebasepath", metavar="PATH",
+        help="Rebase filepaths from CWD, or SOURCEPATH if specified, to "+
+            "PATH in the manifests")
+
+
+
+    parser.set_defaults(user="root")
+    parser.set_defaults(group="root")
+    parser.set_defaults(mode="644")
+    parser.set_defaults(output="-")
+#    parser.set_defaults(followSymlinks=False)
+    parser.set_defaults(enableRecursion=True)
+
+    (options, args) = parser.parse_args(args)
+
+    generator = ManifestGenerator(options)
+    generator.run()
+    generator.dumpManifest()
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+
