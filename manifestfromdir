@@ -148,7 +148,7 @@ class ManifestGenerator:
             # Handle symbolic links
             self.verbose("\tIt is a symbolic link")
 
-            target = os.path.realpath(path)
+            target = os.path.realpath(self.rewritePath(path))
 
             self.statementBegin(path)
             self.statementParam("ensure", "link", '')
